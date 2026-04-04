@@ -11,6 +11,7 @@
 #include <fftw3.h>
 #include <ctime> 
 #include <cstdlib>
+#include <tiffio.h>
 
 namespace fs = std::filesystem;
 using namespace H5;
@@ -77,6 +78,37 @@ struct RGBImage {
         file.close();
         cout << "已保存: " << filename << " (" << width << "x" << height << ")" << endl;
     }
+
+    void saveTIFF(const string& filename) {
+        TIFF* out = TIFFOpen(filename.c_str(), "w");
+        if (!out) return;
+
+        // 设置必要的 TIFF 标签
+        TIFFSetField(out, TIFFTAG_IMAGEWIDTH, width);
+        TIFFSetField(out, TIFFTAG_IMAGELENGTH, height);
+        TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, 3);      // RGB 三通道
+        TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, 8);
+        TIFFSetField(out, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+        TIFFSetField(out, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+        TIFFSetField(out, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_RGB);
+        TIFFSetField(out, TIFFTAG_COMPRESSION, COMPRESSION_LZW); // 推荐 LZW 无损压缩
+
+        // 组装临时行缓冲区进行写入
+        unsigned char* line = new unsigned char[width * 3];
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int idx = y * width + x;
+                line[x * 3 + 0] = r[idx];
+                line[x * 3 + 1] = g[idx];
+                line[x * 3 + 2] = b[idx];
+            }
+            TIFFWriteScanline(out, line, y);
+        }
+
+        delete[] line;
+        TIFFClose(out);
+        cout << "已保存 TIFF (彩色): " << filename << endl;
+    }
 };
 
 struct GrayImage {
@@ -101,6 +133,25 @@ struct GrayImage {
         file.write(reinterpret_cast<char*>(data), size);
         file.close();
         cout << "已保存灰度图: " << filename << " (" << width << "x" << height << ")" << endl;
+    }
+
+    void saveTIFF(const string& filename) {
+        TIFF* out = TIFFOpen(filename.c_str(), "w");
+        if (!out) return;
+
+        TIFFSetField(out, TIFFTAG_IMAGEWIDTH, width);
+        TIFFSetField(out, TIFFTAG_IMAGELENGTH, height);
+        TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, 1);      // 灰度单通道
+        TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, 8);
+        TIFFSetField(out, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+        TIFFSetField(out, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
+
+        for (int y = 0; y < height; y++) {
+            TIFFWriteScanline(out, &data[y * width], y);
+        }
+
+        TIFFClose(out);
+        cout << "已保存 TIFF (灰度): " << filename << endl;
     }
 };
 
@@ -174,110 +225,120 @@ void applySpeckleFilter(vector<float>& data, int width, int height, float streng
     }
 }
 
+// 快速伪随机函数，用于制造单视散斑的颗粒感
+inline float get_jitter(int x, int y) {
+    float dot = x * 12.9898f + y * 78.233f;
+    float sn = fmod(sin(dot) * 43758.5453f, 1.0f);
+    return (sn < 0) ? sn + 1.0f : sn;
+}
+
 RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& config) {
-    cout << "\n正在执行稳健版 CSI 处理..." << endl;
+    cout << "\n执行：线性背景还原 + 高密度荧光绿爆破 (修正版)..." << endl;
     int totalPixels = width * height;
     RGBImage* output = new RGBImage(width, height);
 
-    // 1. 分配 FFTW 空间
+    // 1. 频谱变换
     fftwf_complex* in = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * totalPixels);
     fftwf_complex* spec = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * totalPixels);
-
     for (int i = 0; i < totalPixels; i++) {
-        in[i][0] = input[i].real();
-        in[i][1] = input[i].imag();
+        in[i][0] = input[i].real(); in[i][1] = input[i].imag();
     }
-
-    // 2. 变换到频域
     fftwf_plan p_for = fftwf_plan_dft_2d(height, width, in, spec, FFTW_FORWARD, FFTW_ESTIMATE);
     fftwf_execute(p_for);
 
-    // [核心改进]：为了防止切错频率，我们手动构造三个覆盖不同方位向频谱的子孔径
-    // 这里假设方位向是 Height 方向。我们将频谱分为上、中、下三段。
-    auto extractSub = [&](int shift_type) -> vector<float> {
-        fftwf_complex* sub_spec = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * totalPixels);
-        memset(sub_spec, 0, sizeof(fftwf_complex) * totalPixels);
-
-        // 使用余弦窗（Hanning）进行平滑切分，减少噪点
-        for (int y = 0; y < height; y++) {
-            float weight = 0;
-            // shift_type: 0-低频(R), 1-中频(G), 2-高频(B)
-            // 这里的逻辑对应方位向多普勒频率的划分
-            float relative_y = (float)y / height;
-            if (shift_type == 0) weight = pow(cos(PI * (relative_y - 0.2f) * 2.5f), 2); // 偏左
-            else if (shift_type == 1) weight = pow(cos(PI * (relative_y - 0.5f) * 2.5f), 2); // 中间
-            else weight = pow(cos(PI * (relative_y - 0.8f) * 2.5f), 2); // 偏右
-
-            if (weight < 0) weight = 0;
-
-            for (int x = 0; x < width; x++) {
-                int idx = y * width + x;
-                sub_spec[idx][0] = spec[idx][0] * weight;
-                sub_spec[idx][1] = spec[idx][1] * weight;
+    // 2. 物理多视提取 (9视物理底图)
+    auto getPureMultiLook = [&](int channelIdx) -> vector<float> {
+        const int K = 3;
+        vector<float> channelMag(totalPixels, 0.0f);
+        for (int k = 0; k < K; k++) {
+            fftwf_complex* sub_spec = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * totalPixels);
+            memset(sub_spec, 0, sizeof(fftwf_complex) * totalPixels);
+            int subIdx = channelIdx * K + k;
+            float center = 0.2f + subIdx * (0.6f / 8.0f);
+            for (int y = 0; y < height; y++) {
+                float rel_y = (float)y / height;
+                float weight = max(0.0f, (float)pow(cos(3.14159f * (rel_y - center) * 4.0f), 2));
+                for (int x = 0; x < width; x++) {
+                    int idx = y * width + x;
+                    sub_spec[idx][0] = spec[idx][0] * weight;
+                    sub_spec[idx][1] = spec[idx][1] * weight;
+                }
             }
+            fftwf_complex* out_c = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * totalPixels);
+            fftwf_plan p_b = fftwf_plan_dft_2d(height, width, sub_spec, out_c, FFTW_BACKWARD, FFTW_ESTIMATE);
+            fftwf_execute(p_b);
+            for (int i = 0; i < totalPixels; i++)
+                channelMag[i] += sqrt(out_c[i][0] * out_c[i][0] + out_c[i][1] * out_c[i][1]);
+            fftwf_destroy_plan(p_b); fftwf_free(sub_spec); fftwf_free(out_c);
         }
-
-        fftwf_complex* out_img = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * totalPixels);
-        fftwf_plan p_back = fftwf_plan_dft_2d(height, width, sub_spec, out_img, FFTW_BACKWARD, FFTW_ESTIMATE);
-        fftwf_execute(p_back);
-
-        vector<float> mag(totalPixels);
-        for (int i = 0; i < totalPixels; i++) {
-            mag[i] = sqrt(out_img[i][0] * out_img[i][0] + out_img[i][1] * out_img[i][1]);
-        }
-
-        fftwf_destroy_plan(p_back);
-        fftwf_free(sub_spec);
-        fftwf_free(out_img);
-        return mag;
+        for (int i = 0; i < totalPixels; i++) channelMag[i] /= (float)K;
+        return channelMag;
         };
 
-    vector<float> magR = extractSub(0);
-    vector<float> magG = extractSub(1);
-    vector<float> magB = extractSub(2);
+    vector<float> mR = getPureMultiLook(0), mG = getPureMultiLook(1), mB = getPureMultiLook(2);
 
-    // [核心改进]：Sigma 归一化（解决对比度差、全图黑的问题）
-    auto finalizeChannel = [&](const vector<float>& mag, unsigned char* outPtr) {
-        // 计算均值和标准差
-        double sum = 0, sq_sum = 0;
-        for (float v : mag) { sum += v; sq_sum += v * v; }
-        float mean = sum / totalPixels;
-        float std = sqrt(sq_sum / totalPixels - mean * mean);
-
-        // SAR 标准映射：将 [Mean, Mean + 3*Std] 映射到 [0, 255]
-        // 这样可以极大地拉开高光和背景的差距
-        float minV = mean;
-        float maxV = mean + 4.0f * std; // 4倍标准差通常能涵盖绝大多数人造目标
-
-        for (int i = 0; i < totalPixels; i++) {
-            float val = (mag[i] - minV) / (maxV - minV + 1e-6f);
-            if (val < 0) val = 0;
-            if (val > 1) val = 1;
-            // 应用强 Gamma 变换增加暗部细节
-            outPtr[i] = (unsigned char)(pow(val, config.gamma) * 255);
-        }
-        };
-
-    finalizeChannel(magR, output->r);
-    finalizeChannel(magG, output->g);
-    finalizeChannel(magB, output->b);
-
-    // [色彩增强]：如果是人造目标，人为拉开 RGB 间距
+    // 3. 统计能量 (确定映射门限)
+    double sum = 0, sq_sum = 0;
     for (int i = 0; i < totalPixels; i++) {
-        float r = output->r[i], g = output->g[i], b = output->b[i];
-        float avg = (r + g + b) / 3.0f;
-        // 如果亮度足够高，说明可能是人造目标，强化其色彩差异
-        if (avg > 50) {
-            output->r[i] = (unsigned char)clamp(avg + (r - avg) * config.colorEnhance, 0.0f, 255.0f);
-            output->g[i] = (unsigned char)clamp(avg + (g - avg) * config.colorEnhance, 0.0f, 255.0f);
-            output->b[i] = (unsigned char)clamp(avg + (b - avg) * config.colorEnhance, 0.0f, 255.0f);
+        float a = (mR[i] + mG[i] + mB[i]) / 3.0f;
+        sum += a; sq_sum += (double)a * a;
+    }
+    float mu = (float)(sum / totalPixels), sig = (float)sqrt(sq_sum / totalPixels - (double)mu * mu);
+    float hi = mu + 4.8f * sig;
+
+    // 4. 定向增强逻辑
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int i = y * width + x;
+            float r = mR[i], g = mG[i], b = mB[i];
+            float avg = (r + g + b) / 3.0f;
+
+            // A. 背景线性保真：完全不抑制，保住地形所有灰度细节
+            float L = (avg / (hi + 1e-6f)) * 255.0f;
+
+            float fr, fg, fb;
+            float threshold = 155.0f;
+
+            if (L > threshold) {
+                // B. 高光区单色绿化爆破
+                float W = (L - threshold) / (255.0f - threshold);
+
+                // --- 强化策略：收紧随机抖动范围 (0.88 - 1.12) 让色彩更密 ---
+                float jitter = 0.88f + get_jitter(x, y) * 0.24f;
+
+                // 核心：基于 L 的非线性绿色拉升
+                // 使用 (2.5 + W * 4.5) 极大化增益，配合 jitter 制造颗粒感
+                fg = L + (avg * config.colorEnhance * (2.5f + W * 4.5f) * jitter);
+
+                // 二次荧光爆破曲线
+                float glow = 1.0f + pow(W, 2.0f) * 1.8f;
+                fg *= glow;
+
+                // 彻底压低 R 和 B，防止变白，保持纯净绿色
+                fr = L * (0.12f - W * 0.1f);
+                fb = L * (0.12f - W * 0.1f);
+
+                // 最终亮度加成
+                float final_boost = 1.3f + W * 0.9f;
+                fr *= final_boost; fg *= final_boost; fb *= final_boost;
+            }
+            else {
+                // C. 背景区：维持原始物理色比，线性输出
+                float scale = L / (avg + 1e-6f);
+                fr = r * scale; fg = g * scale; fb = b * scale;
+            }
+
+            auto finalize = [&](float v) {
+                return (unsigned char)max(0.0f, min(255.0f, pow(v / 255.0f, config.gamma) * 255.0f));
+                };
+
+            output->r[i] = finalize(fr);
+            output->g[i] = finalize(fg);
+            output->b[i] = finalize(fb);
         }
     }
 
-    fftwf_destroy_plan(p_for);
-    fftwf_free(in);
-    fftwf_free(spec);
-
+    fftwf_destroy_plan(p_for); fftwf_free(in); fftwf_free(spec);
     return output;
 }
 
@@ -361,7 +422,7 @@ int main() {
             }
 
             if (!fs::exists(filename)) {
-                cerr << "❌ 文件不存在: " << filename << endl;
+                cerr << "× 文件不存在: " << filename << endl;
                 continue; // 返回菜单重新输入
             }
 
@@ -467,6 +528,7 @@ int main() {
                 GrayImage* grayTest = createGrayImage(data, testW, testH, config.gamma);
                 string grayTestFile = "original_" + config.name + "_test_gray.pgm";
                 grayTest->savePGM(grayTestFile);
+                grayTest->saveTIFF("original_" + config.name + "_test.tiff");
                 delete grayTest;
             }
 
@@ -479,7 +541,7 @@ int main() {
             if (fullMode) {
                 long long totalMemory = (long long)fullWidth * fullHeight * sizeof(Complex);
                 if (totalMemory > 2LL * 1024 * 1024 * 1024) { // 2GB 预警
-                    cout << "⚠️ 警告：全图需要 " << totalMemory / (1024 * 1024) << " MB 内存。是否继续？(y/n): ";
+                    cout << "！ 警告：全图需要 " << totalMemory / (1024 * 1024) << " MB 内存。是否继续？(y/n): ";
                     string confirm;
                     getline(cin, confirm);
                     if (confirm != "y" && confirm != "Y") {
@@ -492,6 +554,7 @@ int main() {
                 cout << "\n正在生成全图灰度图..." << endl;
                 GrayImage* grayFull = createGrayImage(data, fullWidth, fullHeight, config.gamma);
                 grayFull->savePGM("original_" + config.name + "_full_gray.pgm");
+                grayFull->saveTIFF("original_" + config.name + "_full_gray.tiff");
                 delete grayFull;
             }
             else {
@@ -503,11 +566,12 @@ int main() {
             string outputFile = "csi_" + config.name + "_" + modeStr + ".ppm";
             if (result) {
                 result->savePPM(outputFile);
+                result->saveTIFF("csi_" + config.name + "_" + modeStr + ".tiff");
                 delete result;
             }
             delete[] data;
 
-            cout << "\n✅ 处理完成！结果已保存至: " << outputFile << endl;
+            cout << "\n√ 处理完成！结果已保存至程序文件夹内！"  << endl;
 
             // 询问是否继续处理下一个文件
             cout << "\n----------------------------------------" << endl;
@@ -520,10 +584,10 @@ int main() {
 
         }
         catch (bad_alloc& e) {
-            cerr << "\n❌ 内存分配失败: " << e.what() << endl;
+            cerr << "\n× 内存分配失败: " << e.what() << endl;
         }
         catch (exception& e) {
-            cerr << "\n❌ 处理过程发生错误: " << e.what() << endl;
+            cerr << "\n× 处理过程发生错误: " << e.what() << endl;
         }
     }
 
