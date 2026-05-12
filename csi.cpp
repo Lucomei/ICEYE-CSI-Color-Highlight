@@ -225,15 +225,8 @@ void applySpeckleFilter(vector<float>& data, int width, int height, float streng
     }
 }
 
-// 快速伪随机函数，用于制造单视散斑的颗粒感
-inline float get_jitter(int x, int y) {
-    float dot = x * 12.9898f + y * 78.233f;
-    float sn = fmod(sin(dot) * 43758.5453f, 1.0f);
-    return (sn < 0) ? sn + 1.0f : sn;
-}
-
 RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& config) {
-    cout << "\n执行：线性背景还原 + 高密度荧光绿爆破 (修正版)..." << endl;
+    cout << "\n执行：线性背景还原 + 物理一致性绿色增强 (移除随机闪烁版)..." << endl;
     int totalPixels = width * height;
     RGBImage* output = new RGBImage(width, height);
 
@@ -246,7 +239,7 @@ RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& co
     fftwf_plan p_for = fftwf_plan_dft_2d(height, width, in, spec, FFTW_FORWARD, FFTW_ESTIMATE);
     fftwf_execute(p_for);
 
-    // 2. 物理多视提取 (9视物理底图)
+    // 2. 物理多视提取 (9视处理，这是抹除闪烁的核心基础)
     auto getPureMultiLook = [&](int channelIdx) -> vector<float> {
         const int K = 3;
         vector<float> channelMag(totalPixels, 0.0f);
@@ -273,7 +266,7 @@ RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& co
         }
         for (int i = 0; i < totalPixels; i++) channelMag[i] /= (float)K;
         return channelMag;
-        };
+    };
 
     vector<float> mR = getPureMultiLook(0), mG = getPureMultiLook(1), mB = getPureMultiLook(2);
 
@@ -284,53 +277,50 @@ RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& co
         sum += a; sq_sum += (double)a * a;
     }
     float mu = (float)(sum / totalPixels), sig = (float)sqrt(sq_sum / totalPixels - (double)mu * mu);
-    float hi = mu + 4.8f * sig;
+    
+    // 门限设定：保持 4.5 左右的 sig 以过滤杂波，保留强散射目标
+    float hi = mu + 4.5f * sig;
 
-    // 4. 定向增强逻辑
+    // 4. 定向增强逻辑 (重点修改区域)
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             int i = y * width + x;
             float r = mR[i], g = mG[i], b = mB[i];
             float avg = (r + g + b) / 3.0f;
 
-            // A. 背景线性保真：完全不抑制，保住地形所有灰度细节
+            // 背景线性拉伸 L (0-255)
             float L = (avg / (hi + 1e-6f)) * 255.0f;
+            L = max(0.0f, min(255.0f, L));
 
             float fr, fg, fb;
-            float threshold = 155.0f;
+            float threshold = 140.0f; // 增强触发点
 
             if (L > threshold) {
-                // B. 高光区单色绿化爆破
+                // 计算当前像素的强散射权重 W
                 float W = (L - threshold) / (255.0f - threshold);
 
-                // --- 强化策略：收紧随机抖动范围 (0.88 - 1.12) 让色彩更密 ---
-                float jitter = 0.88f + get_jitter(x, y) * 0.24f;
+                // --- 修改点：删除 jitter，改用基于 W 的平滑增强 ---
+                // 1. 绿色通道：使用线性增益 + 基础系数，不再有随机跳变
+                // 我们用 (1.5 + W * 3.0) 这种平滑系数代替之前的 jitter 爆破
+                fg = L + (avg * config.colorEnhance * (1.5f + W * 3.0f));
 
-                // 核心：基于 L 的非线性绿色拉升
-                // 使用 (2.5 + W * 4.5) 极大化增益，配合 jitter 制造颗粒感
-                fg = L + (avg * config.colorEnhance * (2.5f + W * 4.5f) * jitter);
+                // 2. 红色和蓝色通道：适当压低，保持绿色纯度，但保留 30% 亮度防止色彩断层
+                fr = L * 0.3f;
+                fb = L * 0.3f;
 
-                // 二次荧光爆破曲线
-                float glow = 1.0f + pow(W, 2.0f) * 1.8f;
-                fg *= glow;
-
-                // 彻底压低 R 和 B，防止变白，保持纯净绿色
-                fr = L * (0.12f - W * 0.1f);
-                fb = L * (0.12f - W * 0.1f);
-
-                // 最终亮度加成
-                float final_boost = 1.3f + W * 0.9f;
+                // 3. 亮度加成
+                float final_boost = 1.2f + W * 0.5f;
                 fr *= final_boost; fg *= final_boost; fb *= final_boost;
             }
             else {
-                // C. 背景区：维持原始物理色比，线性输出
+                // 背景区：维持原始物理色比
                 float scale = L / (avg + 1e-6f);
                 fr = r * scale; fg = g * scale; fb = b * scale;
             }
 
             auto finalize = [&](float v) {
                 return (unsigned char)max(0.0f, min(255.0f, pow(v / 255.0f, config.gamma) * 255.0f));
-                };
+            };
 
             output->r[i] = finalize(fr);
             output->g[i] = finalize(fg);
