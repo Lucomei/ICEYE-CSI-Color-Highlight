@@ -12,6 +12,7 @@
 #include <ctime> 
 #include <cstdlib>
 #include <tiffio.h>
+#include <queue>
 
 namespace fs = std::filesystem;
 using namespace H5;
@@ -20,8 +21,8 @@ using namespace std;
 const float PI = 3.14159265358979323846f;
 using Complex = complex<float>;
 
-const int TEST_WIDTH = 2048;
-const int TEST_HEIGHT = 2048;
+const int TEST_WIDTH = 5096;
+const int TEST_HEIGHT = 5096;
 
 struct BandConfig {
     string name;
@@ -226,12 +227,12 @@ void applySpeckleFilter(vector<float>& data, int width, int height, float streng
 }
 
 RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& config) {
-    cout << "\n正在执行 CSI 处理（各向异性检测+发光高亮模式）..." << endl;
+    cout << "\n正在执行 CSI 处理（凸包填充+曳尾光晕+高亮色彩）..." << endl;
     int totalPixels = width * height;
 
     // 1. 先生成灰度底图
     cout << "1/5 生成灰度底图..." << endl;
-    GrayImage* baseGray = createGrayImage(input, width, height, config.gamma * 1.3f);
+    GrayImage* baseGray = createGrayImage(input, width, height, config.gamma * 1.2f);
 
     // 2. 子孔径分解
     cout << "2/5 分配FFT内存..." << endl;
@@ -248,68 +249,70 @@ RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& co
     fftwf_execute(p_for);
     fftshift2D(spec, width, height);
 
-    // 子孔径提取（使用更窄的频带，增强各向异性检测能力）
-    auto extractSub = [&](int shift_type) -> vector<float> {
-        fftwf_complex* sub_spec = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * totalPixels);
-        memset(sub_spec, 0, sizeof(fftwf_complex) * totalPixels);
+    // 多视提取
+    const int LOOKS = 3;
 
-        for (int y = 0; y < height; y++) {
-            float weight = 0;
-            float relative_y = (float)y / height;
-            if (shift_type == 0) {
-                float center = 0.2f;
-                float width_band = 0.35f;  // 更窄的频带
-                float dist = fabs(relative_y - center);
-                if (dist < width_band / 2) {
-                    weight = 0.5f * (1.0f + cos(2.0f * PI * dist / width_band));
-                }
-            }
-            else if (shift_type == 1) {
-                float center = 0.5f;
-                float width_band = 0.35f;
-                float dist = fabs(relative_y - center);
-                if (dist < width_band / 2) {
-                    weight = 0.5f * (1.0f + cos(2.0f * PI * dist / width_band));
-                }
-            }
-            else {
-                float center = 0.8f;
-                float width_band = 0.35f;
-                float dist = fabs(relative_y - center);
-                if (dist < width_band / 2) {
-                    weight = 0.5f * (1.0f + cos(2.0f * PI * dist / width_band));
-                }
-            }
+    auto extractMultiLookSub = [&](int shift_type) -> vector<float> {
+        vector<float> channelMag(totalPixels, 0.0f);
 
-            for (int x = 0; x < width; x++) {
-                int idx = y * width + x;
-                sub_spec[idx][0] = spec[idx][0] * weight;
-                sub_spec[idx][1] = spec[idx][1] * weight;
-            }
+        float centers[3];
+        if (shift_type == 0) {
+            centers[0] = 0.14f; centers[1] = 0.20f; centers[2] = 0.26f;
+        }
+        else if (shift_type == 1) {
+            centers[0] = 0.44f; centers[1] = 0.50f; centers[2] = 0.56f;
+        }
+        else {
+            centers[0] = 0.74f; centers[1] = 0.80f; centers[2] = 0.86f;
         }
 
-        fftwf_complex* out_img = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * totalPixels);
-        fftwf_plan p_back = fftwf_plan_dft_2d(height, width, sub_spec, out_img, FFTW_BACKWARD, FFTW_ESTIMATE);
-        fftwf_execute(p_back);
+        float width_band = 0.18f;
 
-        vector<float> mag(totalPixels);
-        float norm_factor = 1.0f / (width * height);
-        for (int i = 0; i < totalPixels; i++) {
-            mag[i] = sqrt(out_img[i][0] * out_img[i][0] + out_img[i][1] * out_img[i][1]) * norm_factor;
+        for (int look = 0; look < LOOKS; look++) {
+            fftwf_complex* sub_spec = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * totalPixels);
+            memset(sub_spec, 0, sizeof(fftwf_complex) * totalPixels);
+
+            float center = centers[look];
+
+            for (int y = 0; y < height; y++) {
+                float weight = 0;
+                float relative_y = (float)y / height;
+                float dist = fabs(relative_y - center);
+                if (dist < width_band / 2) {
+                    weight = 0.5f * (1.0f + cos(2.0f * PI * dist / width_band));
+                }
+
+                for (int x = 0; x < width; x++) {
+                    int idx = y * width + x;
+                    sub_spec[idx][0] = spec[idx][0] * weight;
+                    sub_spec[idx][1] = spec[idx][1] * weight;
+                }
+            }
+
+            fftwf_complex* out_img = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * totalPixels);
+            fftwf_plan p_back = fftwf_plan_dft_2d(height, width, sub_spec, out_img, FFTW_BACKWARD, FFTW_ESTIMATE);
+            fftwf_execute(p_back);
+
+            float norm_factor = 1.0f / (width * height);
+            for (int i = 0; i < totalPixels; i++) {
+                float mag = sqrt(out_img[i][0] * out_img[i][0] + out_img[i][1] * out_img[i][1]) * norm_factor;
+                channelMag[i] += mag;
+            }
+
+            fftwf_destroy_plan(p_back);
+            fftwf_free(sub_spec);
+            fftwf_free(out_img);
         }
 
-        fftwf_destroy_plan(p_back);
-        fftwf_free(sub_spec);
-        fftwf_free(out_img);
-        return mag;
+        return channelMag;
         };
 
-    cout << "4/5 提取子孔径..." << endl;
-    vector<float> magR = extractSub(0);
-    vector<float> magG = extractSub(1);
-    vector<float> magB = extractSub(2);
+    cout << "4/5 多视提取子孔径..." << endl;
+    vector<float> magR = extractMultiLookSub(0);
+    vector<float> magG = extractMultiLookSub(1);
+    vector<float> magB = extractMultiLookSub(2);
 
-    // 归一化彩色通道
+    // 归一化
     auto normalizeChannel = [&](const vector<float>& mag) -> vector<float> {
         double sum = 0, sq_sum = 0;
         for (float v : mag) { sum += v; sq_sum += v * v; }
@@ -330,47 +333,33 @@ RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& co
     vector<float> normG = normalizeChannel(magG);
     vector<float> normB = normalizeChannel(magB);
 
-    // ========== 关键：计算各向异性程度 ==========
-    // 各向异性 = 三个子孔径响应的差异程度
-    // 各向同性（自然地形）：三个值相近 -> anisotropy小
-    // 各向异性（人造目标）：三个值差异大 -> anisotropy大
-    vector<float> anisotropy(totalPixels);      // 各向异性程度（0-1）
-    vector<float> intensity(totalPixels);       // 总强度
+    // 计算各向异性和强度
+    vector<float> anisotropy(totalPixels);
+    vector<float> intensity(totalPixels);
     vector<float> originalHue(totalPixels, 0.0f);
 
     for (int i = 0; i < totalPixels; i++) {
         float r = normR[i], g = normG[i], b = normB[i];
         float max_c = max({ r, g, b });
-        float min_c = min({ r, g, b });
         float mean_c = (r + g + b) / 3.0f;
-
         intensity[i] = mean_c;
 
-        // 计算变异系数（标准差/均值）作为各向异性度量
         float var = ((r - mean_c) * (r - mean_c) + (g - mean_c) * (g - mean_c) + (b - mean_c) * (b - mean_c)) / 3.0f;
         float cv = sqrt(var) / (mean_c + 1e-6f);
-
-        // 各向异性程度：cv越大，各向异性越强
-        // 自然地形（各向同性）的cv通常 < 0.3
-        // 人造目标（各向异性）的cv通常 > 0.5
         anisotropy[i] = min(1.0f, cv * 1.5f);
 
-        // 记录主色调倾向
         if (max_c == r) originalHue[i] = 0.0f;
         else if (max_c == g) originalHue[i] = 1.0f;
         else originalHue[i] = 2.0f;
     }
 
-    // ========== 基于各向异性识别强目标 ==========
-    // 人造目标条件：各向异性高 且 强度足够（排除弱噪声）
+    // 识别强目标
     vector<float> targetStrength(totalPixels);
-
-    float min_intensity = 0.15f;   // 强度至少15%
-    float min_anisotropy = 0.45f;  // 各向异性至少45%（排除自然地形）
+    float min_intensity = 0.18f;
+    float min_anisotropy = 0.45f;
 
     for (int i = 0; i < totalPixels; i++) {
         if (intensity[i] > min_intensity && anisotropy[i] > min_anisotropy) {
-            // 目标强度 = 各向异性 × 强度
             targetStrength[i] = anisotropy[i] * intensity[i];
         }
         else {
@@ -378,117 +367,326 @@ RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& co
         }
     }
 
-    // 计算强目标阈值（前2%）
+    // 计算阈值
     vector<float> sortedStrength = targetStrength;
     sort(sortedStrength.begin(), sortedStrength.end(), greater<float>());
-
     float strongTargetThresh = 0.0f;
-    int strong_idx = totalPixels * 2 / 100;
+    int strong_idx = totalPixels * 10 / 1000;
     if (strong_idx < totalPixels) strongTargetThresh = sortedStrength[strong_idx];
     strongTargetThresh = max(strongTargetThresh, 0.08f);
 
-    // 空间滤波：去除孤立噪点
-    vector<float> filteredStrength = targetStrength;
-    int half = 1;
-    for (int y = half; y < height - half; y++) {
-        for (int x = half; x < width - half; x++) {
+    cout << "   强度阈值: " << min_intensity << ", 各向异性阈值: " << min_anisotropy << endl;
+    cout << "   强目标阈值: " << strongTargetThresh << endl;
+
+    // 核心目标掩码
+    vector<bool> coreTarget(totalPixels, false);
+    int strongCount = 0;
+    for (int i = 0; i < totalPixels; i++) {
+        if (targetStrength[i] > strongTargetThresh) {
+            coreTarget[i] = true;
+            strongCount++;
+        }
+    }
+    cout << "   识别核心目标: " << strongCount << endl;
+
+    // ========== 凸包填充 ==========
+    struct Point {
+        int x, y;
+        Point() : x(0), y(0) {}
+        Point(int _x, int _y) : x(_x), y(_y) {}
+    };
+
+    vector<int> labelMap(totalPixels, -1);
+    int labelCount = 0;
+    vector<vector<Point> > regionPoints;
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
             int idx = y * width + x;
-            if (targetStrength[idx] > strongTargetThresh) {
-                int neighbor_count = 0;
-                for (int ky = -half; ky <= half; ky++) {
-                    for (int kx = -half; kx <= half; kx++) {
-                        int nidx = (y + ky) * width + (x + kx);
-                        if (targetStrength[nidx] > strongTargetThresh) neighbor_count++;
+            if (coreTarget[idx] && labelMap[idx] == -1) {
+                vector<Point> points;
+                queue<pair<int, int> > q;
+                q.push(make_pair(x, y));
+                labelMap[idx] = labelCount;
+                points.push_back(Point(x, y));
+
+                while (!q.empty()) {
+                    pair<int, int> front = q.front(); q.pop();
+                    int cx = front.first;
+                    int cy = front.second;
+                    for (int dy = -1; dy <= 1; dy++) {
+                        for (int dx = -1; dx <= 1; dx++) {
+                            int nx = cx + dx, ny = cy + dy;
+                            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                                int nidx = ny * width + nx;
+                                if (coreTarget[nidx] && labelMap[nidx] == -1) {
+                                    labelMap[nidx] = labelCount;
+                                    q.push(make_pair(nx, ny));
+                                    points.push_back(Point(nx, ny));
+                                }
+                            }
+                        }
                     }
                 }
-                if (neighbor_count < 3) {
-                    filteredStrength[idx] = 0.0f;
+                regionPoints.push_back(points);
+                labelCount++;
+            }
+        }
+    }
+
+    auto convexHull = [](vector<Point>& pts) -> vector<Point> {
+        if (pts.size() <= 1) return pts;
+        sort(pts.begin(), pts.end(), [](Point a, Point b) {
+            return a.x < b.x || (a.x == b.x && a.y < b.y);
+            });
+        vector<Point> hull;
+        for (int i = 0; i < (int)pts.size(); i++) {
+            while (hull.size() >= 2) {
+                Point& a = hull[hull.size() - 2];
+                Point& b = hull.back();
+                if ((b.x - a.x) * (pts[i].y - a.y) - (b.y - a.y) * (pts[i].x - a.x) <= 0)
+                    hull.pop_back();
+                else break;
+            }
+            hull.push_back(pts[i]);
+        }
+        int lower = hull.size();
+        for (int i = pts.size() - 2; i >= 0; i--) {
+            while (hull.size() > lower) {
+                Point& a = hull[hull.size() - 2];
+                Point& b = hull.back();
+                if ((b.x - a.x) * (pts[i].y - a.y) - (b.y - a.y) * (pts[i].x - a.x) <= 0)
+                    hull.pop_back();
+                else break;
+            }
+            hull.push_back(pts[i]);
+        }
+        if (hull.size() > 1) hull.pop_back();
+        return hull;
+        };
+
+    auto pointInPolygon = [](Point p, vector<Point>& poly) -> bool {
+        bool inside = false;
+        for (int i = 0, j = poly.size() - 1; i < (int)poly.size(); j = i++) {
+            if (((poly[i].y > p.y) != (poly[j].y > p.y)) &&
+                (p.x < (poly[j].x - poly[i].x) * (p.y - poly[i].y) / (poly[j].y - poly[i].y) + poly[i].x)) {
+                inside = !inside;
+            }
+        }
+        return inside;
+        };
+
+    vector<bool> convexFilled(totalPixels, false);
+    int totalHullPixels = 0;
+
+    for (int r = 0; r < (int)regionPoints.size(); r++) {
+        vector<Point>& points = regionPoints[r];
+        if (points.size() < 5) {
+            for (int i = 0; i < (int)points.size(); i++) {
+                convexFilled[points[i].y * width + points[i].x] = true;
+            }
+            continue;
+        }
+
+        vector<Point> hull = convexHull(points);
+        if (hull.size() < 3) continue;
+
+        int minX = width, maxX = 0, minY = height, maxY = 0;
+        for (int i = 0; i < (int)hull.size(); i++) {
+            minX = min(minX, hull[i].x);
+            maxX = max(maxX, hull[i].x);
+            minY = min(minY, hull[i].y);
+            maxY = max(maxY, hull[i].y);
+        }
+
+        for (int y = minY; y <= maxY; y++) {
+            for (int x = minX; x <= maxX; x++) {
+                Point p(x, y);
+                if (pointInPolygon(p, hull)) {
+                    int idx = y * width + x;
+                    convexFilled[idx] = true;
+                    totalHullPixels++;
                 }
             }
         }
     }
-    targetStrength = filteredStrength;
 
-    // 重新计算最终阈值
-    sortedStrength = targetStrength;
-    sort(sortedStrength.begin(), sortedStrength.end(), greater<float>());
-    strongTargetThresh = 0.0f;
-    strong_idx = totalPixels * 1 / 100;  // 前1%
-    if (strong_idx < totalPixels) strongTargetThresh = sortedStrength[strong_idx];
-    strongTargetThresh = max(strongTargetThresh, 0.10f);
-
-    cout << "   各向异性阈值: " << min_anisotropy << ", 强目标阈值: " << strongTargetThresh << endl;
-
-    // 统计各向异性分布
-    int highAnisoCount = 0;
     for (int i = 0; i < totalPixels; i++) {
-        if (anisotropy[i] > 0.5f && intensity[i] > 0.15f) highAnisoCount++;
+        if (coreTarget[i]) convexFilled[i] = true;
     }
-    cout << "   高各向异性点: " << highAnisoCount << " (" << 100.0 * highAnisoCount / totalPixels << "%)" << endl;
 
-    // ========== 发光高亮合成 ==========
-    cout << "5/5 生成发光高亮效果..." << endl;
+    cout << "   凸包填充像素: " << totalHullPixels << endl;
+
+    // ========== 曳尾光晕效果 ==========
+    // 高亮度彗星核 5x5
+    float cometKernel[5][5] = {
+        {0.2f, 0.3f, 0.5f, 0.7f, 0.9f},
+        {0.2f, 0.3f, 0.5f, 0.8f, 1.0f},
+        {0.2f, 0.3f, 0.6f, 1.0f, 1.0f},
+        {0.2f, 0.3f, 0.5f, 0.8f, 1.0f},
+        {0.2f, 0.3f, 0.5f, 0.7f, 0.9f}
+    };
+
+    // 8个曳尾方向
+    int directions[8][2] = {
+        {1, 0}, {1, 1}, {0, 1}, {-1, 1},
+        {-1, 0}, {-1, -1}, {0, -1}, {1, -1}
+    };
+
+    vector<float> starLayer(totalPixels, 0.0f);
+    vector<float> starR(totalPixels, 0.0f);
+    vector<float> starG(totalPixels, 0.0f);
+    vector<float> starB(totalPixels, 0.0f);
+
+    srand(42);
+
+    // 1. 边缘核心点：带曳尾的彗星效果
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int idx = y * width + x;
+            if (coreTarget[idx]) {
+                int dirIdx = (x * 7 + y * 13) % 8;
+                int dxDir = directions[dirIdx][0];
+                int dyDir = directions[dirIdx][1];
+
+                float strength = min(1.0f, targetStrength[idx] / strongTargetThresh);
+
+                for (int dy = -2; dy <= 2; dy++) {
+                    for (int dx = -2; dx <= 2; dx++) {
+                        int nx = x + dx, ny = y + dy;
+                        if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                            int kx = dx + 2;
+                            int ky = dy + 2;
+
+                            int dot = dx * dxDir + dy * dyDir;
+                            float tailBoost = 1.0f;
+                            if (dot > 0) tailBoost = 1.0f + dot * 0.25f;
+
+                            float val = strength * cometKernel[ky][kx] * tailBoost;
+
+                            int nidx = ny * width + nx;
+                            if (val > starLayer[nidx]) {
+                                starLayer[nidx] = val;
+
+                                int seed = x * 65537 + y * 131071;
+                                float hue_tilt = ((seed >> 8) & 0xFF) / 255.0f;
+                                float hue = (originalHue[idx] + hue_tilt * 0.2f);
+                                if (hue > 2.5f) hue -= 2.0f;
+
+                                if (hue < 0.6f) {
+                                    starR[nidx] = 1.0f;
+                                    starG[nidx] = 0.20f + hue_tilt * 0.15f;
+                                    starB[nidx] = 0.10f + hue_tilt * 0.10f;
+                                }
+                                else if (hue < 1.4f) {
+                                    starR[nidx] = 0.15f + (1.0f - hue_tilt) * 0.10f;
+                                    starG[nidx] = 1.0f;
+                                    starB[nidx] = 0.20f + hue_tilt * 0.15f;
+                                }
+                                else if (hue < 2.2f) {
+                                    starR[nidx] = 0.25f + hue_tilt * 0.15f;
+                                    starG[nidx] = 0.15f + (1.0f - hue_tilt) * 0.10f;
+                                    starB[nidx] = 1.0f;
+                                }
+                                else {
+                                    starR[nidx] = 1.0f;
+                                    starG[nidx] = 0.15f + hue_tilt * 0.15f;
+                                    starB[nidx] = 0.80f + hue_tilt * 0.20f;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. 凸包内部：普通星星
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int idx = y * width + x;
+            if (convexFilled[idx] && !coreTarget[idx]) {
+                if ((x % 6 == 3) && (y % 6 == 3)) {
+                    int seed = x * 131071 + y * 65537;
+                    float random = (seed % 100) / 100.0f;
+
+                    if (random < 0.8f) {
+                        for (int dy = -2; dy <= 2; dy++) {
+                            for (int dx = -2; dx <= 2; dx++) {
+                                int nx = x + dx, ny = y + dy;
+                                if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                                    int kx = dx + 2, ky = dy + 2;
+                                    float strength = 0.6f + random * 0.3f;
+                                    float val = strength * cometKernel[ky][kx] * 0.6f;
+
+                                    int nidx = ny * width + nx;
+                                    if (val > starLayer[nidx]) {
+                                        starLayer[nidx] = val;
+
+                                        int seed2 = x * 65537 + y * 131071;
+                                        float hue_tilt = ((seed2 >> 8) & 0xFF) / 255.0f;
+                                        float hue = (originalHue[idx] + hue_tilt * 0.2f);
+                                        if (hue > 2.5f) hue -= 2.0f;
+
+                                        if (hue < 0.6f) {
+                                            starR[nidx] = 0.85f;
+                                            starG[nidx] = 0.25f + hue_tilt * 0.15f;
+                                            starB[nidx] = 0.15f + hue_tilt * 0.10f;
+                                        }
+                                        else if (hue < 1.4f) {
+                                            starR[nidx] = 0.20f + (1.0f - hue_tilt) * 0.10f;
+                                            starG[nidx] = 0.85f;
+                                            starB[nidx] = 0.25f + hue_tilt * 0.15f;
+                                        }
+                                        else if (hue < 2.2f) {
+                                            starR[nidx] = 0.30f + hue_tilt * 0.15f;
+                                            starG[nidx] = 0.20f + (1.0f - hue_tilt) * 0.10f;
+                                            starB[nidx] = 0.85f;
+                                        }
+                                        else {
+                                            starR[nidx] = 0.85f;
+                                            starG[nidx] = 0.20f + hue_tilt * 0.15f;
+                                            starB[nidx] = 0.70f + hue_tilt * 0.20f;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    int starCount = 0;
+    for (int i = 0; i < totalPixels; i++) {
+        if (starLayer[i] > 0.01f) starCount++;
+    }
+    cout << "   星星像素: " << starCount << " (" << 100.0 * starCount / totalPixels << "%)" << endl;
+
+    // ========== 合成最终图像 ==========
+    cout << "5/5 合成图像..." << endl;
     RGBImage* output = new RGBImage(width, height);
-
-    int strongCount = 0;
 
     for (int i = 0; i < totalPixels; i++) {
         unsigned char gray_val = baseGray->data[i];
-        unsigned char dark_gray = (unsigned char)(gray_val * 0.7f);
+        unsigned char dark_gray = (unsigned char)(gray_val * 0.75f);
 
-        if (targetStrength[i] > strongTargetThresh) {
-            strongCount++;
+        if (starLayer[i] > 0.05f) {
+            float r = starR[i] * starLayer[i];
+            float g = starG[i] * starLayer[i];
+            float b = starB[i] * starLayer[i];
 
-            float strength_factor = min(1.0f, targetStrength[i] / strongTargetThresh);
-
-            // 获取随机颜色倾向
-            int x = i % width;
-            int y = i / width;
-            int seed = x * 65537 + y * 131071;
-            float hue_tilt = ((seed >> 8) & 0xFF) / 255.0f;
-
-            // 发光效果
-            float brightness = 0.85f + strength_factor * 0.15f;
-            float color_strength = 0.25f + strength_factor * 0.25f;
-
-            float r_final, g_final, b_final;
-
-            // 根据各向异性方向决定发光颜色（不同频率对应不同颜色）
-            float hue = (originalHue[i] + hue_tilt * 0.3f);
-            if (hue > 2.5f) hue -= 2.0f;
-
-            if (hue < 0.8f) {
-                // 红色/橙色发光（对应低频子孔径强）
-                r_final = brightness;
-                g_final = brightness * (0.5f + color_strength * 0.3f);
-                b_final = brightness * (0.3f + color_strength * 0.2f);
-            }
-            else if (hue < 1.8f) {
-                // 绿色/青色发光（对应中频子孔径强）
-                r_final = brightness * (0.4f + color_strength * 0.3f);
-                g_final = brightness;
-                b_final = brightness * (0.5f + color_strength * 0.3f);
-            }
-            else {
-                // 蓝色/紫色发光（对应高频子孔径强）
-                r_final = brightness * (0.5f + color_strength * 0.3f);
-                g_final = brightness * (0.4f + color_strength * 0.2f);
-                b_final = brightness;
-            }
-
-            output->r[i] = (unsigned char)(r_final * 255);
-            output->g[i] = (unsigned char)(g_final * 255);
-            output->b[i] = (unsigned char)(b_final * 255);
+            output->r[i] = (unsigned char)(min(1.0f, r) * 255);
+            output->g[i] = (unsigned char)(min(1.0f, g) * 255);
+            output->b[i] = (unsigned char)(min(1.0f, b) * 255);
         }
         else {
-            // 非目标区域：纯灰度
             output->r[i] = dark_gray;
             output->g[i] = dark_gray;
             output->b[i] = dark_gray;
         }
     }
-
-    cout << "   强目标=" << strongCount << " (" << 100.0 * strongCount / totalPixels << "%)" << endl;
 
     delete baseGray;
     fftwf_destroy_plan(p_for);
@@ -601,7 +799,7 @@ int main() {
 
             // 选择处理模式
             cout << "\n请选择处理模式:" << endl;
-            cout << "1. 测试区域模式 (2048x2048) - 快速处理" << endl;
+            cout << "1. 测试区域模式 (5096x5096) - 快速处理" << endl;
             cout << "2. 全图模式 - 处理整个图像 (可能需要大量内存)" << endl;
             cout << "请输入选择 (1/2，直接回车默认测试区域): ";
 
