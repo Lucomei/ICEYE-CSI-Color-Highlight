@@ -14,6 +14,16 @@
 #include <tiffio.h>
 #include <queue>
 
+#ifdef _MSC_VER
+#pragma warning(disable: 4018)  // 有符号/无符号不匹配
+#pragma warning(disable: 4244)  // double 转 float
+#pragma warning(disable: 4267)  // size_t 转 int
+#pragma warning(disable: 4305)  // 截断
+#pragma warning(disable: 4996)  // 安全函数
+#pragma warning(disable: 6385)  // 缓冲区溢出误报
+#pragma warning(disable: 6386)  // 缓冲区溢出误报
+#endif
+
 namespace fs = std::filesystem;
 using namespace H5;
 using namespace std;
@@ -206,28 +216,8 @@ GrayImage* createGrayImage(Complex* data, int width, int height, float gamma) {
     return output;
 }
 
-void applySpeckleFilter(vector<float>& data, int width, int height, float strength) {
-    if (strength <= 0) return;
-    vector<float> temp = data;
-    int kernelSize = 3;
-    int half = kernelSize / 2;
-
-    for (int y = half; y < height - half; y++) {
-        for (int x = half; x < width - half; x++) {
-            int idx = y * width + x;
-            float sum = 0;
-            for (int ky = -half; ky <= half; ky++) {
-                for (int kx = -half; kx <= half; kx++) {
-                    sum += temp[(y + ky) * width + (x + kx)];
-                }
-            }
-            data[idx] = data[idx] * (1 - strength) + (sum / 9.0f) * strength;
-        }
-    }
-}
-
 RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& config) {
-    cout << "\n正在执行 CSI 处理（凸包填充+曳尾光晕+高亮色彩）..." << endl;
+    cout << "\n正在执行 CSI 处理（凸包填充+曳尾光晕+亮白核心）..." << endl;
     int totalPixels = width * height;
 
     // 1. 先生成灰度底图
@@ -478,6 +468,8 @@ RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& co
 
     vector<bool> convexFilled(totalPixels, false);
     int totalHullPixels = 0;
+    vector<vector<Point> > convexHulls;  // 存储每个区域的凸包
+    vector<int> hullCentersX, hullCentersY;  // 存储凸包中心
 
     for (int r = 0; r < (int)regionPoints.size(); r++) {
         vector<Point>& points = regionPoints[r];
@@ -485,12 +477,30 @@ RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& co
             for (int i = 0; i < (int)points.size(); i++) {
                 convexFilled[points[i].y * width + points[i].x] = true;
             }
+            convexHulls.push_back(vector<Point>());
+            hullCentersX.push_back(0);
+            hullCentersY.push_back(0);
             continue;
         }
 
         vector<Point> hull = convexHull(points);
-        if (hull.size() < 3) continue;
+        convexHulls.push_back(hull);
+        if (hull.size() < 3) {
+            hullCentersX.push_back(0);
+            hullCentersY.push_back(0);
+            continue;
+        }
 
+        // 计算凸包中心
+        float centerX = 0, centerY = 0;
+        for (int i = 0; i < (int)hull.size(); i++) {
+            centerX += hull[i].x;
+            centerY += hull[i].y;
+        }
+        hullCentersX.push_back((int)(centerX / hull.size()));
+        hullCentersY.push_back((int)(centerY / hull.size()));
+
+        // 填充凸包内部
         int minX = width, maxX = 0, minY = height, maxY = 0;
         for (int i = 0; i < (int)hull.size(); i++) {
             minX = min(minX, hull[i].x);
@@ -512,10 +522,58 @@ RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& co
     }
 
     for (int i = 0; i < totalPixels; i++) {
-        if (coreTarget[i]) convexFilled[i] = true;
+        if (coreTarget[i]) { convexFilled[i] = true;  totalHullPixels++; }
+
     }
 
     cout << "   凸包填充像素: " << totalHullPixels << endl;
+
+    // ========== 生成亮白核心（凸包内部20%面积，形状与凸包相似） ==========
+    vector<bool> whiteCore(totalPixels, false);
+    float coreScale = 0.45f;  // 缩放因子 0.45 -> 面积约20% (0.45^2=0.2025)
+
+    for (int r = 0; r < (int)convexHulls.size(); r++) {
+        vector<Point>& hull = convexHulls[r];
+        if (hull.size() < 3) continue;
+
+        int centerX = hullCentersX[r];
+        int centerY = hullCentersY[r];
+
+        // 生成缩放后的凸包
+        vector<Point> scaledHull;
+        for (int i = 0; i < (int)hull.size(); i++) {
+            int nx = centerX + (int)((hull[i].x - centerX) * coreScale);
+            int ny = centerY + (int)((hull[i].y - centerY) * coreScale);
+            scaledHull.push_back(Point(nx, ny));
+        }
+
+        // 填充缩放凸包内部
+        int minX = width, maxX = 0, minY = height, maxY = 0;
+        for (int i = 0; i < (int)scaledHull.size(); i++) {
+            minX = min(minX, scaledHull[i].x);
+            maxX = max(maxX, scaledHull[i].x);
+            minY = min(minY, scaledHull[i].y);
+            maxY = max(maxY, scaledHull[i].y);
+        }
+
+        for (int y = minY; y <= maxY; y++) {
+            for (int x = minX; x <= maxX; x++) {
+                Point p(x, y);
+                if (pointInPolygon(p, scaledHull)) {
+                    int idx = y * width + x;
+                    if (convexFilled[idx]) {  // 只在原凸包内部有效
+                        whiteCore[idx] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    int whiteCoreCount = 0;
+    for (int i = 0; i < totalPixels; i++) {
+        if (whiteCore[i]) whiteCoreCount++;
+    }
+    cout << "   亮白核心像素: " << whiteCoreCount << endl;
 
     // ========== 曳尾光晕效果 ==========
     // 高亮度彗星核 5x5
@@ -540,11 +598,11 @@ RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& co
 
     srand(42);
 
-    // 1. 边缘核心点：带曳尾的彗星效果
+    // 1. 边缘核心点：带曳尾的彗星效果（避开亮白核心）
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             int idx = y * width + x;
-            if (coreTarget[idx]) {
+            if (coreTarget[idx] && !whiteCore[idx]) {
                 int dirIdx = (x * 7 + y * 13) % 8;
                 int dxDir = directions[dirIdx][0];
                 int dyDir = directions[dirIdx][1];
@@ -601,11 +659,11 @@ RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& co
         }
     }
 
-    // 2. 凸包内部：普通星星
+    // 2. 凸包内部：普通星星（避开亮白核心）
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             int idx = y * width + x;
-            if (convexFilled[idx] && !coreTarget[idx]) {
+            if (convexFilled[idx] && !coreTarget[idx] && !whiteCore[idx]) {
                 if ((x % 6 == 3) && (y % 6 == 3)) {
                     int seed = x * 131071 + y * 65537;
                     float random = (seed % 100) / 100.0f;
@@ -672,10 +730,20 @@ RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& co
         unsigned char gray_val = baseGray->data[i];
         unsigned char dark_gray = (unsigned char)(gray_val * 0.75f);
 
-        if (starLayer[i] > 0.05f) {
+        // 优先显示亮白核心
+        if (whiteCore[i]) {
+            output->r[i] = 255;
+            output->g[i] = 255;
+            output->b[i] = 255;
+        }
+        else if (starLayer[i] > 0.05f) {
             float r = starR[i] * starLayer[i];
             float g = starG[i] * starLayer[i];
             float b = starB[i] * starLayer[i];
+
+            r = min(1.0f, r * 1.2f);
+            g = min(1.0f, g * 1.2f);
+            b = min(1.0f, b * 1.2f);
 
             output->r[i] = (unsigned char)(min(1.0f, r) * 255);
             output->g[i] = (unsigned char)(min(1.0f, g) * 255);
@@ -696,7 +764,6 @@ RGBImage* processCSI(Complex* input, int width, int height, const BandConfig& co
     cout << "CSI处理完成！" << endl;
     return output;
 }
-
 // 读取HDF5数据集
 short* readHDF5Data(const string& filename, const string& datasetName, int& width, int& height) {
     try {
